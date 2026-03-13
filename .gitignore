@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Generated at runtime — reset by reset.sh
+factory/db.json
+factory/artifacts/*.whl
+factory/artifacts/*.patch
+
+# Shim temp
+/tmp/echo_fix.txt
