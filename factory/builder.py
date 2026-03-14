@@ -20,7 +20,16 @@ from pathlib import Path
 
 import requests
 
+_FACTORY_DIR = Path(__file__).parent
+if str(_FACTORY_DIR) not in sys.path:
+    sys.path.insert(0, str(_FACTORY_DIR))
+try:
+    from api_checker import check_api_compatibility as _check_api
+except ImportError:
+    _check_api = None  # type: ignore[assignment]
+
 DB_PATH = Path(__file__).parent / "db.json"
+API_DIFF_CACHE_PATH = Path(__file__).parent / "api_diff_cache.json"
 ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
 PYPI_JSON_URL = "https://pypi.org/pypi/{package}/{version}/json"
 
@@ -55,7 +64,7 @@ def get_top_level_dir(tarball: Path) -> str:
 def extract_and_rename(tarball: Path, workdir: Path, target_name: str) -> Path:
     top = get_top_level_dir(tarball)
     with tarfile.open(tarball, "r:gz") as tf:
-        tf.extractall(workdir)
+        tf.extractall(workdir, filter="data")
     renamed = workdir / target_name
     if renamed.exists():
         shutil.rmtree(renamed)
@@ -105,22 +114,111 @@ def _find_version_file(source_dir: Path, version: str) -> Path | None:
 
 
 def bump_version(source_dir: Path, old_version: str, new_version: str) -> bool:
+    found = False
+
+    # 1. Update the primary version source file
     version_file = _find_version_file(source_dir, old_version)
     if version_file is None:
         print(f"  [WARN] Could not locate version string '{old_version}' in {source_dir}")
-        return False
-    text = version_file.read_text(errors="replace")
-    new_text = text.replace(f'"{old_version}"', f'"{new_version}"')
-    new_text = new_text.replace(f"'{old_version}'", f"'{new_version}'")
-    if new_text == text:
-        print(f"  [WARN] Version string '{old_version}' unchanged in {version_file}")
-        return False
-    version_file.write_text(new_text)
-    print(f"  Bumped {version_file.relative_to(source_dir)}: {old_version!r} → {new_version!r}")
-    return True
+    else:
+        text = version_file.read_text(errors="replace")
+        new_text = text.replace(f'"{old_version}"', f'"{new_version}"')
+        new_text = new_text.replace(f"'{old_version}'", f"'{new_version}'")
+        if new_text == text:
+            print(f"  [WARN] Version string '{old_version}' unchanged in {version_file}")
+        else:
+            version_file.write_text(new_text)
+            print(f"  Bumped {version_file.relative_to(source_dir)}: {old_version!r} → {new_version!r}")
+            found = True
+
+    # 2. Update PKG-INFO — hatch-vcs reads this when building from sdist (no git repo)
+    pkg_info = source_dir / "PKG-INFO"
+    if pkg_info.exists():
+        text = pkg_info.read_text(errors="replace")
+        # Replace the Version header line
+        new_text = re.sub(
+            rf"^(Version:\s*){re.escape(old_version)}\s*$",
+            f"\\g<1>{new_version}",
+            text,
+            flags=re.MULTILINE,
+        )
+        if new_text != text:
+            pkg_info.write_text(new_text)
+            print(f"  Bumped PKG-INFO Version: {old_version!r} → {new_version!r}")
+            found = True
+
+    # 3. Neutralise hatch-vcs in pyproject.toml:
+    #    - source="vcs"            → replaced with path= so hatchling reads _version.py
+    #    - local_scheme="no-local-version" → removed (it strips the +echo1 suffix)
+    #    - [tool.hatch.build.hooks.vcs]    → removed (re-writes _version.py at build time)
+    pyproject = source_dir / "pyproject.toml"
+    if pyproject.exists():
+        text = pyproject.read_text(errors="replace")
+
+        # Find the version-file path from the build hook (most reliable source)
+        vf_match = re.search(r'version-file\s*=\s*["\']([^"\']+)["\']', text)
+        version_file_path = vf_match.group(1) if vf_match else f"src/{source_dir.name}/_version.py"
+
+        patched = text
+        # a. Replace source="vcs" with path=<version_file>
+        patched = re.sub(
+            r'source\s*=\s*["\']vcs["\']',
+            f'path = "{version_file_path}"',
+            patched,
+        )
+        # b. Remove the raw-options subsection (contains local_scheme=no-local-version)
+        patched = re.sub(
+            r'\[tool\.hatch\.version\.raw-options\][^\[]*',
+            '',
+            patched,
+            flags=re.DOTALL,
+        )
+        # c. Remove the build hook that re-writes _version.py from VCS at build time
+        patched = re.sub(
+            r'\[tool\.hatch\.build\.hooks\.vcs\][^\[]*',
+            '',
+            patched,
+            flags=re.DOTALL,
+        )
+        if patched != text:
+            pyproject.write_text(patched)
+            print("  Patched pyproject.toml: disabled hatch-vcs source + local-version strip")
+
+    return found
 
 
 # ── patch helpers ──────────────────────────────────────────────────────────────
+
+_NOISE_PATTERNS = re.compile(
+    r'^(test[s]?/|docs?/|dummyserver/|\.github/|'
+    r'.*\.(rst|md|lock)|PKG-INFO|CHANGES|README|LICENSE|'
+    r'.*_version\.py|.*__version__\.py)',
+    re.IGNORECASE,
+)
+
+
+def _filter_source_patch(patch_text: str, package_name: str) -> str:
+    """Keep only src/<package>/ hunks; drop tests, docs, metadata, version files."""
+    if not patch_text.strip():
+        return patch_text
+
+    kept_blocks = []
+    raw_blocks = re.split(r'(?=^diff -ru )', patch_text, flags=re.MULTILINE)
+
+    for block in raw_blocks:
+        if not block.strip():
+            continue
+        m = re.match(r'diff -ru \S+/(\S+) ', block)
+        if not m:
+            kept_blocks.append(block)
+            continue
+        filepath = m.group(1)
+        if _NOISE_PATTERNS.match(filepath):
+            continue
+        kept_blocks.append(block)
+
+    return "".join(kept_blocks)
+
 
 def make_patch(workdir: Path, patch_dest: Path) -> None:
     result = subprocess.run(
@@ -183,9 +281,66 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
+def _load_api_diff_cache() -> dict:
+    if API_DIFF_CACHE_PATH.exists():
+        return json.loads(API_DIFF_CACHE_PATH.read_text())
+    return {}
+
+
+def _save_api_diff_cache(cache: dict) -> None:
+    API_DIFF_CACHE_PATH.write_text(json.dumps(cache, indent=2) + "\n")
+
+
 # ── main processing ────────────────────────────────────────────────────────────
 
-def process_entry(entry: dict) -> None:
+_G = "\033[0;32m"
+_Y = "\033[1;33m"
+_R = "\033[0;31m"
+_C = "\033[0;36m"
+_B = "\033[1m"
+_X = "\033[0m"
+
+
+def _detect_strategy(entry: dict) -> str:
+    if entry.get("resolution_plan", {}).get("backport_strategy"):
+        return "BACKPORT"
+    return "BUMP"
+
+
+def _print_scenario_banner(cve_id: str, package: str, strategy: str) -> None:
+    bar = "─" * 62
+    if strategy == "BACKPORT":
+        header_color = _Y
+        label = "SCENARIO B — BACKPORT"
+        detail = "API breaking changes — building patched wheel"
+        action = "→ building local echo-patched wheel"
+    else:
+        header_color = _G
+        label = "SCENARIO A — BUMP"
+        detail = "no breaking changes detected"
+        action = "→ verifying PyPI release only"
+    print(f"\n  {header_color}┌{bar}┐{_X}")
+    print(f"  {header_color}│{_X}  {_B}{label}{_X}  [{cve_id}]  {package}")
+    print(f"  {header_color}│{_X}  {detail}")
+    print(f"  {header_color}│{_X}  {action}")
+    print(f"  {header_color}└{bar}┘{_X}\n")
+
+
+def _process_bump_entry(entry: dict) -> None:
+    package = entry.get("package", "")
+    target = entry.get("resolution_plan", {}).get("bump_strategy", {}).get("target_version", "")
+    if not target or target == "unknown":
+        print(f"  [BUMP] No target_version — skipping verification.")
+        return
+    try:
+        get_sdist_url(package, target)
+        print(f"  [BUMP] Verified {package}=={target} on PyPI — no wheel to build.")
+        entry["resolution_plan"]["bump_strategy"]["verified"] = True
+    except Exception as exc:
+        print(f"  [BUMP] Could not verify {package}=={target} on PyPI: {exc}")
+
+
+def _process_backport_entry(entry: dict) -> None:
     cve_id: str = entry["cve_id"]
     package: str = entry["package"]
     first_patched: str = entry.get("first_patched_version", "unknown")
@@ -250,12 +405,37 @@ def process_entry(entry: dict) -> None:
                 print(f"  [ERROR] Extraction failed: {exc} — skipping.")
                 continue
 
+            # Compute and cache api_diff for this sub-group
+            cache_key = f"{package}:{pivot}:{first_patched}"
+            if _check_api is not None:
+                diff_cache = _load_api_diff_cache()
+                if cache_key not in diff_cache:
+                    try:
+                        api_diff_result = _check_api(package, pivot, first_patched)
+                        diff_cache[cache_key] = api_diff_result
+                        _save_api_diff_cache(diff_cache)
+                        breaking = api_diff_result.get("has_breaking_changes", False)
+                        print(f"  API diff: {'BREAKING' if breaking else 'clean'} ({cache_key})")
+                    except Exception as exc:
+                        print(f"  [WARN] api_diff failed: {exc}")
+                else:
+                    print(f"  API diff: cached ({cache_key})")
+
             print("  Running diff ...")
             try:
                 make_patch(workdir, patch_path)
             except Exception as exc:
                 print(f"  [ERROR] diff failed: {exc} — skipping.")
                 continue
+
+            # Filter to security-relevant source files only
+            raw_patch = patch_path.read_text()
+            filtered = _filter_source_patch(raw_patch, package)
+            if filtered != raw_patch:
+                dropped = raw_patch.count("\ndiff -ru ") - filtered.count("\ndiff -ru ")
+                kept = filtered.count("\ndiff -ru ") + (1 if filtered.startswith("diff") else 0)
+                print(f"  Filtered patch: kept {kept} source file(s), dropped {dropped} noise file(s)")
+                patch_path.write_text(filtered)
 
             artifact["patch_file"] = str(patch_path)
 
@@ -267,6 +447,11 @@ def process_entry(entry: dict) -> None:
 
             bumped_version = f"{pivot}+echo1"
             print(f"  Bumping version to {bumped_version!r} ...")
+            # The security patch may have updated _version.py from pivot→first_patched.
+            # Try bumping the post-patch version (first_patched) first; it's what's
+            # actually in the source now.  Then also update PKG-INFO (which still
+            # carries the pre-patch pivot version from the original sdist).
+            bump_version(old_dir, first_patched, bumped_version)
             bump_version(old_dir, pivot, bumped_version)
 
             print("  Building wheel ...")
@@ -288,6 +473,20 @@ def process_entry(entry: dict) -> None:
             artifact["sha256"] = sha256_of(dest_wheel)
             artifact["size_bytes"] = dest_wheel.stat().st_size
             print(f"  sha256={artifact['sha256'][:16]}...  size={artifact['size_bytes']}")
+
+
+def process_entry(entry: dict) -> None:
+    strategy = _detect_strategy(entry)
+    _print_scenario_banner(
+        entry.get("cve_id", "?"),
+        entry.get("package", "?"),
+        strategy,
+    )
+
+    if strategy == "BUMP":
+        _process_bump_entry(entry)
+    else:
+        _process_backport_entry(entry)
 
 
 def main() -> None:

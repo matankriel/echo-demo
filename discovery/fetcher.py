@@ -69,9 +69,16 @@ def build_cve_entry(advisory: dict, vuln: dict) -> dict | None:
     cvss_score = (advisory.get("cvss") or {}).get("score")
     strategy = decide_strategy(vulnerable_range, first_patched) if first_patched else "BACKPORT"
 
+    # pivot = last VULNERABLE version (one step before the fix)
+    # This ensures old != new so the diff contains the real security patch.
     try:
         v = Version(first_patched)
-        pivot_version = f"{v.major}.{v.minor}.{v.micro}"
+        if v.micro > 0:
+            pivot_version = f"{v.major}.{v.minor}.{v.micro - 1}"
+        elif v.minor > 0:
+            pivot_version = f"{v.major}.{v.minor - 1}.0"
+        else:
+            pivot_version = first_patched  # can't go lower; same-version diff is fine
     except Exception:
         pivot_version = first_patched or "unknown"
 
@@ -110,11 +117,32 @@ def build_cve_entry(advisory: dict, vuln: dict) -> dict | None:
     }
 
 
+def _hardcoded_requests_entry() -> dict:
+    return {
+        "cve_id": "CVE-2023-32681",
+        "package": "requests",
+        "severity": "High",
+        "cvss_score": 6.1,
+        "status": "Active",
+        "fix_commit_sha": "74ea7cf7",
+        "first_patched_version": "2.31.0",
+        "patch_file_uid": str(uuid.uuid4()),
+        "resolution_plan": {
+            "bump_strategy": {
+                "affected_range": ">=2.1.0, <2.31.0",
+                "target_version": "2.31.0",
+                "notes": "Safe minor upgrade path identified.",
+            },
+            "backport_strategy": [],
+        },
+    }
+
+
 def main():
     token = get_token()
-    print("Fetching urllib3 high-severity advisories...")
+    print("Fetching urllib3 high-severity advisories + injecting requests CVE-2023-32681...")
     advisories = fetch_advisories(token)
-    print(f"Found {len(advisories)} advisories.")
+    print(f"Found {len(advisories)} urllib3 advisories.")
 
     db = []
     if DB_PATH.exists():
@@ -123,7 +151,14 @@ def main():
             db = json.loads(content) if content else []
     existing_ids = {e["cve_id"] for e in db}
 
-    new_entries = []
+    new_entries: list[dict] = []
+
+    # Inject hardcoded requests CVE
+    req_entry = _hardcoded_requests_entry()
+    if req_entry["cve_id"] not in existing_ids:
+        new_entries.append(req_entry)
+        existing_ids.add(req_entry["cve_id"])
+
     for advisory in advisories:
         for vuln in advisory.get("vulnerabilities") or []:
             entry = build_cve_entry(advisory, vuln)

@@ -9,6 +9,7 @@ from packaging.version import Version
 from packaging.specifiers import SpecifierSet
 
 DB_PATH = Path(__file__).parent.parent / "factory" / "db.json"
+API_DIFF_CACHE_PATH = Path(__file__).parent.parent / "factory" / "api_diff_cache.json"
 ARTIFACTS_DIR = Path(__file__).parent.parent / "factory" / "artifacts"
 
 app = FastAPI(title="Echo Gateway")
@@ -23,6 +24,19 @@ class ResolveResponse(BaseModel):
     constraint: str | None
     strategy: str | None = None
     cve_id: str | None = None
+    api_scenario: str | None = None
+    api_break_summary: str | None = None
+
+
+def _api_break_summary(api_diff: dict) -> str | None:
+    if not api_diff or api_diff.get("error"):
+        return None
+    r = len(api_diff.get("removed", []))
+    c = len(api_diff.get("changed", []))
+    a = len(api_diff.get("added", []))
+    if api_diff.get("has_breaking_changes"):
+        return f"{r} removed, {c} changed, {a} added — BREAKING"
+    return f"no breaking changes ({a} added)"
 
 
 def load_db() -> list:
@@ -30,6 +44,13 @@ def load_db() -> list:
         with open(DB_PATH) as f:
             return json.load(f)
     return []
+
+
+def load_api_diff_cache() -> dict:
+    if API_DIFF_CACHE_PATH.exists():
+        with open(API_DIFF_CACHE_PATH) as f:
+            return json.load(f)
+    return {}
 
 
 @app.post("/resolve", response_model=ResolveResponse)
@@ -66,7 +87,16 @@ def resolve(req: ResolveRequest):
                         # No local wheel — use plain pivot so pip can resolve from PyPI
                         artifact_version = pivot
                     constraint = f"{req.package}=={artifact_version}"
-                    return ResolveResponse(constraint=constraint, strategy="BACKPORT", cve_id=cve_id)
+                    diff_cache = load_api_diff_cache()
+                    cache_key = f"{req.package}:{backport.get('pivot_stable_version', '')}:{entry.get('first_patched_version', '')}"
+                    api_diff = diff_cache.get(cache_key, {})
+                    return ResolveResponse(
+                        constraint=constraint,
+                        strategy="BACKPORT",
+                        cve_id=cve_id,
+                        api_scenario="BACKPORT",
+                        api_break_summary=_api_break_summary(api_diff),
+                    )
             except Exception:
                 continue
 
@@ -79,7 +109,14 @@ def resolve(req: ResolveRequest):
                 if req_version in spec:
                     target = bump.get("target_version", "")
                     constraint = f"{req.package}=={target}"
-                    return ResolveResponse(constraint=constraint, strategy="BUMP", cve_id=cve_id)
+                    api_diff = {}
+                    return ResolveResponse(
+                        constraint=constraint,
+                        strategy="BUMP",
+                        cve_id=cve_id,
+                        api_scenario="BUMP",
+                        api_break_summary=_api_break_summary(api_diff),
+                    )
             except Exception:
                 pass
 

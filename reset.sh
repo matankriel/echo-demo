@@ -31,9 +31,9 @@ printf "${BOLD}[2/5] Resetting factory/db.json${RESET}\n"
 echo "[]" > "$SCRIPT_DIR/factory/db.json"
 ok "factory/db.json reset to empty array"
 
-# ── 3. Clear artifacts ─────────────────────────────────────────────────────────
+# ── 3. Clear artifacts + api_diff cache ────────────────────────────────────────
 sep
-printf "${BOLD}[3/5] Clearing factory/artifacts${RESET}\n"
+printf "${BOLD}[3/5] Clearing factory/artifacts + api_diff cache${RESET}\n"
 wheel_count=$(find "$SCRIPT_DIR/factory/artifacts" -name "*.whl" 2>/dev/null | wc -l | tr -d ' ')
 patch_count=$(find "$SCRIPT_DIR/factory/artifacts" -name "*.patch" 2>/dev/null | wc -l | tr -d ' ')
 
@@ -51,6 +51,13 @@ else
     skip "No patch files to remove"
 fi
 
+if [[ -f "$SCRIPT_DIR/factory/api_diff_cache.json" ]]; then
+    rm -f "$SCRIPT_DIR/factory/api_diff_cache.json"
+    ok "Removed factory/api_diff_cache.json"
+else
+    skip "api_diff_cache.json did not exist"
+fi
+
 # ── 4. Clear shim temp file ────────────────────────────────────────────────────
 sep
 printf "${BOLD}[4/5] Clearing shim temp files${RESET}\n"
@@ -61,15 +68,19 @@ else
     skip "/tmp/echo_fix.txt did not exist"
 fi
 
-# ── 5. Plant a known-vulnerable urllib3 ───────────────────────────────────────
+# ── 5. Plant known-vulnerable packages ────────────────────────────────────────
 sep
-printf "${BOLD}[5/5] Installing vulnerable urllib3==2.3.0 (demo \"before\" state)${RESET}\n"
-pip install "urllib3==2.3.0" --quiet 2>&1
-installed=$(pip show urllib3 | awk '/^Version:/{print $2}')
-ok "urllib3 $installed installed  ${YELLOW}(known vulnerable — falls in CVE-2026-21441 range >= 1.22, < 2.6.3)${RESET}"
+printf "${BOLD}[5/5] Installing vulnerable versions  (demo \"before\" state)${RESET}\n"
+pip install "urllib3==2.3.0" --no-deps --quiet 2>&1
+pip install "requests==2.28.2" --no-deps --quiet 2>&1
+urllib3_v=$(pip show urllib3  | awk '/^Version:/{print $2}')
+requests_v=$(pip show requests | awk '/^Version:/{print $2}')
+ok "urllib3  $urllib3_v   ${YELLOW}(CVE-2026-21441 — BACKPORT scenario)${RESET}"
+ok "requests $requests_v  ${YELLOW}(CVE-2023-32681 — BUMP scenario)${RESET}"
 
 # ── Done ───────────────────────────────────────────────────────────────────────
 sep
 printf "\n${BOLD}${GREEN}  Reset complete.${RESET}\n"
-printf   "${CYAN}  State: db empty, artifacts cleared, urllib3 ${YELLOW}2.3.0 (vulnerable)${CYAN} planted.${RESET}\n"
+printf   "${CYAN}  State: db empty, artifacts cleared.${RESET}\n"
+printf   "${CYAN}  Planted: urllib3 ${YELLOW}2.3.0${CYAN} (BACKPORT)  requests ${YELLOW}2.28.2${CYAN} (BUMP)${RESET}\n"
 printf   "${CYAN}  Run ${BOLD}./run.sh${RESET}${CYAN} to start the demo.${RESET}\n\n"

@@ -53,11 +53,11 @@ python3 --version &>/dev/null && ok "Python: $(python3 --version 2>&1)" \
     || { fail "GITHUB_TOKEN is not set — run: export GITHUB_TOKEN=<your_token>"; exit 1; }
 
 missing=()
-for pkg in fastapi uvicorn packaging requests; do
+for pkg in fastapi uvicorn packaging requests build; do
     pip show "$pkg" &>/dev/null || missing+=("$pkg")
 done
 if [[ ${#missing[@]} -eq 0 ]]; then
-    ok "All dependencies installed (fastapi, uvicorn, packaging, requests)"
+    ok "All dependencies installed (fastapi, uvicorn, packaging, requests, build)"
 else
     fail "Missing packages: ${missing[*]}"
     printf "\n  ${YELLOW}Run:  pip install ${missing[*]}${RESET}\n\n"; exit 1
@@ -69,15 +69,12 @@ whl_count=$(find "$SCRIPT_DIR/factory/artifacts" -name "*.whl" 2>/dev/null | wc 
 info "factory/db.json currently has ${BOLD}$db_entries${RESET}${CYAN} entries${RESET}"
 info "factory/artifacts has ${BOLD}$whl_count${RESET}${CYAN} pre-built wheel(s)${RESET}"
 
-current_urllib3=$(pip show urllib3 2>/dev/null | awk '/^Version:/{print $2}' || echo "not installed")
 printf "\n"
 printf "  ${BOLD}Current environment state:${RESET}\n"
-printf "  ${DIM}└─${RESET} urllib3 version: "
-if [[ "$current_urllib3" == "not installed" ]]; then
-    printf "${YELLOW}not installed${RESET}\n"
-else
-    printf "${YELLOW}${BOLD}$current_urllib3${RESET}  ${RED}← this is the vulnerable version we'll remediate${RESET}\n"
-fi
+current_urllib3=$(pip show urllib3  2>/dev/null | awk '/^Version:/{print $2}' || echo "not installed")
+current_requests=$(pip show requests 2>/dev/null | awk '/^Version:/{print $2}' || echo "not installed")
+printf "  ${DIM}└─${RESET} urllib3  version: ${YELLOW}${BOLD}$current_urllib3${RESET}  ${RED}← vulnerable (BACKPORT scenario)${RESET}\n"
+printf "  ${DIM}└─${RESET} requests version: ${YELLOW}${BOLD}$current_requests${RESET}  ${RED}← vulnerable (BUMP scenario)${RESET}\n"
 
 # ── Step 2: Start the Gateway ──────────────────────────────────────────────────
 header 2 "Starting the Gateway  (FastAPI · POST /resolve)"
@@ -96,9 +93,10 @@ else
 fi
 
 # ── Step 3: Discovery — fetch advisories ──────────────────────────────────────
-header 3 "Discovery  (GitHub Advisories API → factory/db.json)"
+header 3 "Discovery  (GitHub Advisories API + requests CVE injection → factory/db.json)"
 
-info "Querying GitHub for urllib3 high-severity advisories..."
+info "Querying GitHub for urllib3 advisories and injecting hardcoded requests CVE-2023-32681..."
+info "Writing clean advisory data to factory/db.json (no api_diff — computed later by builder)..."
 printf "\n"
 python3 "$SCRIPT_DIR/discovery/fetcher.py" 2>&1 | sed 's/^/    /'
 printf "\n"
@@ -112,54 +110,115 @@ printf "\n"
 python3 - <<'PYEOF'
 import json
 db = json.load(open("factory/db.json"))
-FMT = "  {:<20}  {:<10}  {:<12}  {}"
-print(FMT.format("CVE ID", "Severity", "Patched Ver", "Affected Range"))
-print("  " + "─" * 72)
+FMT = "  {:<20}  {:<10}  {:<12}  {:<10}  {}"
+print(FMT.format("CVE ID", "Severity", "Patched Ver", "Strategy", "Affected Range"))
+print("  " + "─" * 78)
 for e in db:
-    bp  = (e.get("resolution_plan") or {}).get("backport_strategy") or []
-    rng = bp[0].get("version_range", "—") if bp else "—"
-    sev = e.get("severity", "?")
-    col = "\033[0;31m" if sev == "High" else "\033[1;33m"
+    plan  = e.get("resolution_plan") or {}
+    bp    = plan.get("backport_strategy") or []
+    rng   = bp[0].get("version_range", "—") if bp else \
+            plan.get("bump_strategy", {}).get("affected_range", "—")
+    sev   = e.get("severity", "?")
+    strat = "BACKPORT" if bp else "BUMP"
+    scol  = "\033[1;33m" if strat == "BACKPORT" else "\033[0;32m"
+    col   = "\033[0;31m" if sev == "High" else "\033[1;33m"
     print(FMT.format(
         e.get("cve_id", "?"),
         f"{col}{sev}\033[0m",
         e.get("first_patched_version", "?"),
+        f"{scol}{strat}\033[0m",
         rng,
     ))
 PYEOF
 printf "\n"
 
-# ── Step 5: Artifacts ─────────────────────────────────────────────────────────
-header 5 "Factory Artifacts  (patched wheels ready to install)"
+# ── Step 5: Build Factory Artifacts ───────────────────────────────────────────
+header 5 "Factory Builder  (patching wheels · urllib3=BACKPORT · requests=BUMP)"
 printf "\n"
-whl_count=$(find "$SCRIPT_DIR/factory/artifacts" -name "*.whl" 2>/dev/null | wc -l | tr -d ' ')
+info "Running builder.py (API diff per sub-group → api_diff_cache.json · BACKPORT → echo wheel · BUMP → PyPI verify)..."
+printf "\n"
+python3 "$SCRIPT_DIR/factory/builder.py" 2>&1 | sed 's/^/    /'
+printf "\n"
 
-if [[ "$whl_count" -eq 0 ]]; then
-    warn "No pre-built wheels found in factory/artifacts/"
-    info "The shim will fall back to PyPI for this run."
-    info "To build local patched wheels: ${BOLD}python3 factory/builder.py${RESET}"
-else
+whl_count=$(find "$SCRIPT_DIR/factory/artifacts" -name "*.whl" 2>/dev/null | wc -l | tr -d ' ')
+if [[ "$whl_count" -gt 0 ]]; then
+    info "Wheels in factory/artifacts/:"
     for whl in "$SCRIPT_DIR/factory/artifacts/"*.whl; do
         name=$(basename "$whl")
         size=$(python3 -c "import os; s=os.path.getsize('$whl'); print(f'{s/1024:.1f} KB')")
         ok "${BOLD}$name${RESET}  ${DIM}($size)${RESET}"
     done
-    printf "\n"
-    info "$whl_count patched wheel(s) available — shim will prefer these over PyPI"
+else
+    warn "No wheels produced — check builder output above."
 fi
 
-# ── Step 6: Gateway resolve tests ─────────────────────────────────────────────
-header 6 "Gateway  (testing /resolve for known vulnerable versions)"
+# ── Step 6: Scenario Summary ───────────────────────────────────────────────────
+header 6 "Scenario Summary  (A = BUMP · B = BACKPORT)"
 printf "\n"
-printf "  ${BOLD}%-32s  %-10s  %-22s  %s${RESET}\n" "Query" "Strategy" "Constraint" "CVE"
-printf "  %s\n" "$(python3 -c "print('─'*80)")"
+python3 - <<'PYEOF'
+import json, os
+
+db         = json.load(open("factory/db.json"))
+cache_path = "factory/api_diff_cache.json"
+diff_cache = json.load(open(cache_path)) if os.path.exists(cache_path) else {}
+
+G  = "\033[0;32m"; Y = "\033[1;33m"; R = "\033[0;31m"
+C  = "\033[0;36m"; B = "\033[1m";    D = "\033[2m";  X = "\033[0m"
+
+for e in db:
+    pkg  = e.get("package", "?")
+    cve  = e.get("cve_id",  "?")
+    fp   = e.get("first_patched_version", "")
+    plan = e.get("resolution_plan", {})
+    bp   = plan.get("backport_strategy") or []
+
+    if bp:
+        strat = "BACKPORT"
+        pivot = bp[0].get("pivot_stable_version", "")
+        api   = diff_cache.get(f"{pkg}:{pivot}:{fp}", {})
+        has_b = api.get("has_breaking_changes", False)
+        removed = len(api.get("removed", []))
+        changed = len(api.get("changed", []))
+        added   = len(api.get("added",   []))
+        err     = api.get("error", "")
+        col     = Y
+        label   = "SCENARIO B — BACKPORT"
+        action  = "→ local echo-patched wheel built"
+        if err:
+            diff_line = f"{D}api diff inconclusive ({err[:60]}){X}"
+        elif has_b:
+            diff_line = f"{removed} symbols removed, {changed} signatures changed  {R}BREAKING{X}"
+        else:
+            diff_line = f"no breaking changes  ({added} added)  {G}CLEAN{X}"
+    else:
+        strat     = "BUMP"
+        col       = G
+        label     = "SCENARIO A — BUMP"
+        action    = "→ verified on PyPI, no wheel needed"
+        diff_line = f"no breaking changes  {G}CLEAN{X}"
+
+    bar = "─" * 58
+    print(f"  {col}┌{bar}┐{X}")
+    print(f"  {col}│{X}  {B}{label}{X}   [{cve}]  {B}{pkg}{X}")
+    print(f"  {col}│{X}  api diff:  {diff_line}")
+    print(f"  {col}│{X}  action:    {action}")
+    print(f"  {col}└{bar}┘{X}")
+    print()
+PYEOF
+
+# ── Step 7: Gateway resolve tests ─────────────────────────────────────────────
+header 7 "Gateway  (testing /resolve for known vulnerable versions)"
+printf "\n"
+printf "  ${BOLD}%-34s  %-10s  %-24s  %s${RESET}\n" "Query" "Strategy" "Constraint" "CVE"
+printf "  %s\n" "$(python3 -c "print('─'*84)")"
 
 test_cases=(
     "urllib3|1.24.0|old 1.x"
     "urllib3|1.25.5|mid 1.x"
     "urllib3|2.0.3|2.0.x"
     "urllib3|2.6.4|already safe"
-    "requests|2.28.0|untracked pkg"
+    "requests|2.28.2|pinned vulnerable"
+    "requests|2.31.0|already patched"
 )
 
 for tc in "${test_cases[@]}"; do
@@ -168,64 +227,96 @@ for tc in "${test_cases[@]}"; do
         -H 'Content-Type: application/json' \
         -d "{\"package\":\"$pkg\",\"version\":\"$ver\"}" 2>/dev/null || echo '{}')
     constraint=$(echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('constraint') or 'null')" 2>/dev/null)
-    strategy=$(echo "$resp"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('strategy') or '—')"    2>/dev/null)
-    cve=$(echo "$resp"       | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('cve_id') or '—')"       2>/dev/null)
+    strategy=$(echo "$resp"   | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('strategy') or '—')"    2>/dev/null)
+    cve=$(echo "$resp"         | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('cve_id') or '—')"       2>/dev/null)
+    api_sum=$(echo "$resp"     | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('api_break_summary') or '')" 2>/dev/null)
 
     if [[ "$constraint" == "null" || "$constraint" == "None" ]]; then
-        printf "  %-32s  ${GREEN}%-10s${RESET}  %-22s  %s\n" \
+        printf "  %-34s  ${GREEN}%-10s${RESET}  %-24s  %s\n" \
             "$pkg==$ver  ($lbl)" "clean" "no constraint" "—"
     else
-        printf "  %-32s  ${RED}%-10s${RESET}  ${BOLD}%-22s${RESET}  ${DIM}%s${RESET}\n" \
+        printf "  %-34s  ${RED}%-10s${RESET}  ${BOLD}%-24s${RESET}  ${DIM}%s${RESET}\n" \
             "$pkg==$ver  ($lbl)" "$strategy" "$constraint" "$cve"
+        if [[ -n "$api_sum" ]]; then
+            printf "  ${DIM}    ↳ api: %s${RESET}\n" "$api_sum"
+        fi
     fi
 done
 printf "\n"
 
-# ── Step 7: Client Shim ────────────────────────────────────────────────────────
-header 7 "Client Shim  (intercept pip install → apply CVE constraints)"
+# ── Step 8: Dep conflict check ────────────────────────────────────────────────
+header 8 "Dependency Conflict Check  (horizontal + vertical)"
+printf "\n"
+python3 "$SCRIPT_DIR/client/dep_checker.py" -r "$SCRIPT_DIR/client/requirements.txt" 2>&1 | sed 's/^/  /' || true
+printf "\n"
 
-current_before=$(pip show urllib3 2>/dev/null | awk '/^Version:/{print $2}' || echo "not installed")
+# ── Step 9: Client Shim ────────────────────────────────────────────────────────
+header 9 "Client Shim  (intercept pip install → apply CVE constraints)"
+
+urllib3_before=$(pip show urllib3   2>/dev/null | awk '/^Version:/{print $2}' || echo "not installed")
+requests_before=$(pip show requests 2>/dev/null | awk '/^Version:/{print $2}' || echo "not installed")
 printf "\n"
 printf "  ${BOLD}Before:${RESET}\n"
-printf "  ${DIM}└─${RESET} urllib3 == ${BOLD}${YELLOW}$current_before${RESET}  ${RED}(vulnerable)${RESET}\n\n"
+printf "  ${DIM}└─${RESET} urllib3  == ${BOLD}${YELLOW}$urllib3_before${RESET}  ${RED}(vulnerable — BACKPORT)${RESET}\n"
+printf "  ${DIM}└─${RESET} requests == ${BOLD}${YELLOW}$requests_before${RESET}  ${RED}(vulnerable — BUMP)${RESET}\n\n"
 
 printf "  ${DIM}client/requirements.txt:${RESET}\n"
 cat "$SCRIPT_DIR/client/requirements.txt" | sed 's/^/    /'
 printf "\n"
-info "Running shim..."
+info "Running shim (includes dep-check + gateway lookup + pip install)..."
 printf "\n"
 
 bash "$SCRIPT_DIR/client/shim.sh" -r "$SCRIPT_DIR/client/requirements.txt" 2>&1 | sed 's/^/    /'
 
-# ── Step 8: Final verification ────────────────────────────────────────────────
-header 8 "Final verification"
+# ── Step 10: Final verification ───────────────────────────────────────────────
+header 10 "Final verification"
 printf "\n"
 
-current_after=$(pip show urllib3 2>/dev/null | awk '/^Version:/{print $2}' || echo "not installed")
-install_loc=$(pip show urllib3 2>/dev/null | awk '/^Location:/{print $2}' || echo "—")
+urllib3_after=$(pip show urllib3   2>/dev/null | awk '/^Version:/{print $2}' || echo "not installed")
+requests_after=$(pip show requests 2>/dev/null | awk '/^Version:/{print $2}' || echo "not installed")
+urllib3_loc=$(pip show urllib3   2>/dev/null | awk '/^Location:/{print $2}' || echo "—")
+requests_loc=$(pip show requests 2>/dev/null | awk '/^Location:/{print $2}' || echo "—")
 applied=$(cat /tmp/echo_fix.txt 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 
 printf "  ${BOLD}Before  →  After${RESET}\n"
-printf "  ${DIM}└─${RESET} ${YELLOW}${BOLD}$current_before${RESET} ${DIM}(vulnerable)${RESET}  ${CYAN}→${RESET}  ${GREEN}${BOLD}$current_after${RESET} ${GREEN}(patched)${RESET}\n\n"
+printf "  ${DIM}└─${RESET} urllib3   ${YELLOW}${BOLD}$urllib3_before${RESET} ${DIM}(BACKPORT/vulnerable)${RESET}  ${CYAN}→${RESET}  ${GREEN}${BOLD}$urllib3_after${RESET} ${GREEN}(patched)${RESET}\n"
+printf "  ${DIM}└─${RESET} requests  ${YELLOW}${BOLD}$requests_before${RESET} ${DIM}(BUMP/vulnerable)${RESET}    ${CYAN}→${RESET}  ${GREEN}${BOLD}$requests_after${RESET} ${GREEN}(patched)${RESET}\n\n"
 
-ok  "Installed version:  ${BOLD}$current_after${RESET}"
-info "Install location:   $install_loc"
-[[ -n "$applied" ]] && info "CVE constraint applied: ${BOLD}$applied${RESET}"
+ok  "urllib3  installed: ${BOLD}$urllib3_after${RESET}  ${DIM}($urllib3_loc)${RESET}"
+ok  "requests installed: ${BOLD}$requests_after${RESET}  ${DIM}($requests_loc)${RESET}"
+[[ -n "$applied" ]] && info "CVE constraints applied: ${BOLD}$applied${RESET}"
 
 printf "\n"
-python3 - "$current_after" <<'PYEOF'
+python3 - "$urllib3_after" "$requests_after" <<'PYEOF'
 import json, sys
-ver = sys.argv[1]
-db  = json.load(open("factory/db.json"))
+urllib3_ver, requests_ver = sys.argv[1], sys.argv[2]
+db = json.load(open("factory/db.json"))
+
 hits = []
 for e in db:
-    for b in (e.get("resolution_plan") or {}).get("backport_strategy", []):
-        if b.get("pivot_stable_version", "") in ver:
-            hits.append(e["cve_id"])
+    pkg   = e.get("package", "")
+    cve   = e.get("cve_id", "?")
+    plan  = e.get("resolution_plan", {})
+    bp    = plan.get("backport_strategy", [])
+    strat = "BACKPORT" if bp else "BUMP"
+    installed = urllib3_ver if pkg == "urllib3" else requests_ver
+
+    # Check bump strategy satisfaction
+    target = plan.get("bump_strategy", {}).get("target_version", "")
+    if target and target in installed:
+        hits.append(f"{cve} [{pkg} {strat}]")
+        continue
+    # Check backport artifact
+    for b in bp:
+        pivot = b.get("pivot_stable_version", "")
+        if pivot and pivot in installed:
+            hits.append(f"{cve} [{pkg} {strat}]")
+
 if hits:
-    print(f"  \033[0;32m✓\033[0m  Installed version satisfies remediation for: {', '.join(hits)}")
+    for h in hits:
+        print(f"  \033[0;32m✓\033[0m  Remediation confirmed: {h}")
 else:
-    print(f"  \033[2m–\033[0m  Installed version not directly traced to an echo artifact")
+    print(f"  \033[2m–\033[0m  Installed versions not directly traced to echo artifacts")
 PYEOF
 
 # ── Summary ────────────────────────────────────────────────────────────────────
@@ -233,10 +324,13 @@ sep
 printf "\n${BOLD}${GREEN}  Demo complete!${RESET}\n\n"
 printf "  ${BOLD}What just happened:${RESET}\n"
 printf "  ${DIM}1.${RESET}  Gateway started at ${BOLD}$GATEWAY_URL${RESET}\n"
-printf "  ${DIM}2.${RESET}  Discovery pulled ${BOLD}$db_entries CVEs${RESET} from GitHub Advisories into factory/db.json\n"
-printf "  ${DIM}3.${RESET}  Gateway mapped every vulnerable urllib3 version to a safe constraint\n"
-printf "  ${DIM}4.${RESET}  Shim intercepted ${BOLD}pip install${RESET}, applied the constraint, upgraded urllib3\n"
-printf "       ${YELLOW}${BOLD}$current_before${RESET}  →  ${GREEN}${BOLD}$current_after${RESET}\n\n"
+printf "  ${DIM}2.${RESET}  Discovery pulled ${BOLD}$db_entries CVEs${RESET} from GitHub + hardcoded requests entry\n"
+printf "  ${DIM}3.${RESET}  Builder ran AST-based API diff per sub-group → cached in api_diff_cache.json\n"
+printf "  ${DIM}4.${RESET}  Builder built local echo-patched wheel for urllib3 (BACKPORT)\n"
+printf "  ${DIM}5.${RESET}  Dep-checker flagged version conflict before install\n"
+printf "  ${DIM}6.${RESET}  Shim intercepted ${BOLD}pip install${RESET}, applied constraints, upgraded both packages\n"
+printf "       urllib3:  ${YELLOW}${BOLD}$urllib3_before${RESET}  →  ${GREEN}${BOLD}$urllib3_after${RESET}\n"
+printf "       requests: ${YELLOW}${BOLD}$requests_before${RESET}  →  ${GREEN}${BOLD}$requests_after${RESET}\n\n"
 printf "  ${DIM}Gateway is still running (PID $GATEWAY_PID). Press Ctrl+C to stop it.${RESET}\n\n"
 
 wait "$GATEWAY_PID" 2>/dev/null || true

@@ -11,3 +11,5 @@ factory/artifacts/*.patch
 
 # Shim temp
 /tmp/echo_fix.txt
+factory/api_diff_cache.json
+factory/api_diff_cache 2.json

@@ -27,6 +27,13 @@ fi
 
 req_file=$(realpath "$req_arg")
 
+DEP_CHECKER="$(cd "$(dirname "$0")" && pwd)/dep_checker.py"
+if [[ -f "$DEP_CHECKER" ]]; then
+    printf "\nshim: [dep-check] scanning for dependency conflicts...\n"
+    python3 "$DEP_CHECKER" -r "$req_file" 2>&1 || true
+    printf "\n"
+fi
+
 if [[ ! -f "$req_file" ]]; then
     echo "shim: requirements file not found: $req_file" >&2
     pip "$@"
@@ -87,7 +94,23 @@ fi
 if [[ -s "$CONSTRAINTS_FILE" ]]; then
     echo "shim: applying CVE constraints from $CONSTRAINTS_FILE"
     cat "$CONSTRAINTS_FILE"
-    pip install "$@" -c "$CONSTRAINTS_FILE" --find-links "$ARTIFACTS_DIR"
+
+    # Build resolved install list: constrained versions override pinned ones.
+    # We cannot use -r req.txt -c constraints.txt because pip treats both as
+    # hard requirements and conflicts when they disagree.
+    resolved=()
+    for entry in "${packages[@]}"; do
+        pkg="${entry%% *}"
+        ver="${entry##* }"
+        constraint_line=$(grep -i "^${pkg}==" "$CONSTRAINTS_FILE" 2>/dev/null || echo "")
+        if [[ -n "$constraint_line" ]]; then
+            resolved+=("$constraint_line")
+        else
+            resolved+=("${pkg}==${ver}")
+        fi
+    done
+
+    pip install "${resolved[@]}" --find-links "$ARTIFACTS_DIR"
 
     echo ""
     echo "shim: --- installed versions (echo-patched) ---"
